@@ -2,7 +2,7 @@ module dao_tokens::smart_token {
     use std::option::{Self};
     use std::string;
     use supra_framework::object::{Self, Object, ConstructorRef, object_address};
-    use supra_framework::fungible_asset::{Self, FungibleAsset, TransferRef};
+    use supra_framework::fungible_asset::{Self, FungibleAsset, Metadata, TransferRef};
     use supra_framework::primary_fungible_store;
     use supra_framework::dispatchable_fungible_asset;
     use supra_framework::function_info::{Self, FunctionInfo};
