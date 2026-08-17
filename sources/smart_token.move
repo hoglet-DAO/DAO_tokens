@@ -99,6 +99,9 @@ module dao_tokens::smart_token {
 
         // Lista Negra
         blacklist: vector<address>,
+
+        // Exenciones (Whitelist)
+        exempt_addresses: vector<address>,
     }
 
     /// Initializes the Smart Token. Does not require 'friends', is natively protected by Move 
@@ -119,6 +122,7 @@ module dao_tokens::smart_token {
             max_tx_amount: 0,
             max_wallet_amount: 0,
             blacklist: vector::empty<address>(),
+            exempt_addresses: vector::empty<address>(),
         };
 
         let token_signer = object::generate_signer(constructor_ref);
@@ -163,19 +167,23 @@ module dao_tokens::smart_token {
             };
 
             if (config.is_tax_active) {
-                let tax_amount = (amount * config.sell_tax_bps) / 10000;
-                let burn_amount = (amount * config.auto_burn_bps) / 10000;
+                let is_exempt = vector::contains(&config.exempt_addresses, &sender_address);
+                if (!is_exempt) {
+                    let amount_u128 = (amount as u128);
+                    let tax_amount = (((amount_u128 * (config.sell_tax_bps as u128)) / 10000) as u64);
+                    let burn_amount = (((amount_u128 * (config.auto_burn_bps as u128)) / 10000) as u64);
 
-                if (tax_amount > 0 && config.treasury_address != @0x0) {
-                    let tax_fa = fungible_asset::extract(&mut fa_to_transfer, tax_amount);
-                    let treasury_store = primary_fungible_store::ensure_primary_store_exists(config.treasury_address, metadata);
-                    fungible_asset::deposit_with_ref(transfer_ref, treasury_store, tax_fa);
-                };
+                    if (tax_amount > 0 && config.treasury_address != @0x0) {
+                        let tax_fa = fungible_asset::extract(&mut fa_to_transfer, tax_amount);
+                        let treasury_store = primary_fungible_store::ensure_primary_store_exists(config.treasury_address, metadata);
+                        fungible_asset::deposit_with_ref(transfer_ref, treasury_store, tax_fa);
+                    };
 
-                if (burn_amount > 0) {
-                    let burn_fa = fungible_asset::extract(&mut fa_to_transfer, burn_amount);
-                    let dead_store = primary_fungible_store::ensure_primary_store_exists(DEAD_ADDRESS, metadata);
-                    fungible_asset::deposit_with_ref(transfer_ref, dead_store, burn_fa);
+                    if (burn_amount > 0) {
+                        let burn_fa = fungible_asset::extract(&mut fa_to_transfer, burn_amount);
+                        let dead_store = primary_fungible_store::ensure_primary_store_exists(DEAD_ADDRESS, metadata);
+                        fungible_asset::deposit_with_ref(transfer_ref, dead_store, burn_fa);
+                    };
                 };
             };
         };
@@ -203,6 +211,21 @@ module dao_tokens::smart_token {
             if (config.is_anti_whale_active && config.max_wallet_amount > 0) {
                 let current_balance = primary_fungible_store::balance(receiver_address, metadata);
                 assert!(current_balance + amount <= config.max_wallet_amount, error::out_of_range(E_MAX_WALLET_EXCEEDED));
+            };
+
+            if (config.is_tax_active) {
+                let is_exempt = vector::contains(&config.exempt_addresses, &receiver_address);
+                if (!is_exempt && config.buy_tax_bps > 0) {
+                    let amount_u128 = (amount as u128);
+                    let tax_amount = (((amount_u128 * (config.buy_tax_bps as u128)) / 10000) as u64);
+
+                    if (tax_amount > 0 && config.treasury_address != @0x0) {
+                        let mut_fa = &mut fa;
+                        let tax_fa = fungible_asset::extract(mut_fa, tax_amount);
+                        let treasury_store = primary_fungible_store::ensure_primary_store_exists(config.treasury_address, metadata);
+                        fungible_asset::deposit_with_ref(transfer_ref, treasury_store, tax_fa);
+                    };
+                };
             };
         };
 
@@ -246,6 +269,35 @@ module dao_tokens::smart_token {
             old_treasury,
             new_treasury: treasury_address,
         });
+    }
+
+    /// DAO Admin function to add or remove an address from the tax/anti-whale exempt list
+    public entry fun set_exemption(
+        token_addr: address,
+        caller: &signer,
+        target_address: address,
+        is_exempt: bool
+    ) acquires DaoTokenConfig {
+        let config = borrow_global_mut<DaoTokenConfig>(token_addr);
+        assert!(std::signer::address_of(caller) == config.dao_admin_address, error::permission_denied(E_NOT_AUTHORIZED));
+        
+        let (contains, index) = vector::index_of(&config.exempt_addresses, &target_address);
+        if (is_exempt && !contains) {
+            vector::push_back(&mut config.exempt_addresses, target_address);
+        } else if (!is_exempt && contains) {
+            vector::remove(&mut config.exempt_addresses, index);
+        };
+    }
+
+    /// Transfers the admin role of the token to a new address (e.g. the DAO)
+    public entry fun transfer_admin(
+        token_addr: address,
+        caller: &signer,
+        new_admin: address
+    ) acquires DaoTokenConfig {
+        let config = borrow_global_mut<DaoTokenConfig>(token_addr);
+        assert!(std::signer::address_of(caller) == config.dao_admin_address, error::permission_denied(E_NOT_AUTHORIZED));
+        config.dao_admin_address = new_admin;
     }
 
     public fun update_single_param(
