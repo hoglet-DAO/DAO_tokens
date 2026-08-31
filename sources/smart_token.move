@@ -19,6 +19,7 @@ module dao_tokens::smart_token {
     const E_MAX_WALLET_EXCEEDED: u64 = 4;
     const E_INVALID_FEE: u64 = 5;
     const E_INVALID_ADDRESS: u64 = 6;
+    const E_MAX_LIST_SIZE_EXCEEDED: u64 = 7;
 
     const DEAD_ADDRESS: address = @0x000000000000000000000000000000000000000000000000000000000000dead;
 
@@ -55,14 +56,25 @@ module dao_tokens::smart_token {
     }
 
     /// Capability Object retornado al Launcher.
-    /// The Launcher should pass it to the DAO safely during migration.
+    /// The Launcher should pass it to the DAO safely durante la migracion.
     struct SmartTokenCap has store, drop {
+        token_addr: address,
+    }
+
+    /// Capability para enrutamiento libre de impuestos. 
+    /// Almacenado de forma segura en el DAO Factory.
+    struct TaxFreeCap has store {
         token_addr: address,
     }
 
     struct HookRefs has key {
         withdraw_func: FunctionInfo,
         deposit_func: FunctionInfo,
+    }
+
+    #[resource_group_member(group = supra_framework::object::ObjectGroup)]
+    struct TokenRefs has key {
+        transfer_ref: option::Option<TransferRef>,
     }
 
     fun init_module(sender: &signer) {
@@ -128,6 +140,7 @@ module dao_tokens::smart_token {
 
         let token_signer = object::generate_signer(constructor_ref);
         move_to(&token_signer, config);
+        move_to(&token_signer, TokenRefs { transfer_ref: option::none() });
 
         let hook_refs = borrow_global<HookRefs>(@dao_tokens);
 
@@ -242,6 +255,7 @@ module dao_tokens::smart_token {
     /// Consume the Capability to set the DAO Admin permanently.
     /// This destroys the Cap, transferring the absolute power to the `new_admin`.
     public fun set_dao_admin(cap: SmartTokenCap, new_admin: address) acquires DaoTokenConfig {
+        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
         let SmartTokenCap { token_addr } = cap; // Destruimos el Cap
         let config = borrow_global_mut<DaoTokenConfig>(token_addr);
         
@@ -286,6 +300,8 @@ module dao_tokens::smart_token {
         
         let (contains, index) = vector::index_of(&config.exempt_addresses, &target_address);
         if (is_exempt && !contains) {
+            // SECURITY FIX (L-02): Cap vector size to prevent gas exhaustion
+            assert!(vector::length(&config.exempt_addresses) < 100, error::out_of_range(E_MAX_LIST_SIZE_EXCEEDED));
             vector::push_back(&mut config.exempt_addresses, target_address);
         } else if (!is_exempt && contains) {
             vector::remove(&mut config.exempt_addresses, index);
@@ -309,7 +325,6 @@ module dao_tokens::smart_token {
         
         let old_admin = config.dao_admin_address;
         config.dao_admin_address = new_admin;
-        config.treasury_address = new_admin;
 
         event::emit(AdminChangedEvent {
             token_addr,
@@ -364,6 +379,9 @@ module dao_tokens::smart_token {
             abort error::invalid_argument(E_INVALID_FEE)
         };
 
+        // SECURITY FIX (M-05): Check combined tax cap (max 15% combined tax impact)
+        assert!(config.buy_tax_bps + config.sell_tax_bps + config.auto_burn_bps <= 1500, error::invalid_argument(E_INVALID_FEE));
+
         event::emit(ParameterUpdatedEvent {
             token_addr,
             param_type,
@@ -381,6 +399,8 @@ module dao_tokens::smart_token {
         assert!(std::signer::address_of(caller) == config.dao_admin_address, error::permission_denied(E_NOT_AUTHORIZED));
         let (found, index) = vector::index_of(&config.blacklist, &target);
         if (add_to_blacklist && !found) {
+            // SECURITY FIX (L-02): Cap vector size to prevent gas exhaustion
+            assert!(vector::length(&config.blacklist) < 100, error::out_of_range(E_MAX_LIST_SIZE_EXCEEDED));
             vector::push_back(&mut config.blacklist, target);
         } else if (!add_to_blacklist && found) {
             vector::remove(&mut config.blacklist, index);
@@ -391,6 +411,53 @@ module dao_tokens::smart_token {
             target_address: target,
             is_blacklisted: add_to_blacklist,
         });
+    }
+
+    // ========================================================================
+    // TAX FREE ROUTING (OPTION A)
+    // ========================================================================
+
+    /// Permits the DAO Factory to enable tax-free routing by permanently locking the TransferRef
+    /// inside this module, yielding a TaxFreeCap in return.
+    public fun enable_tax_free_routing(
+        admin: &signer,
+        token_addr: address,
+        transfer_ref: TransferRef
+    ): TaxFreeCap acquires DaoTokenConfig, TokenRefs {
+        let config = borrow_global<DaoTokenConfig>(token_addr);
+        assert!(config.dao_admin_address == std::signer::address_of(admin), error::permission_denied(E_NOT_AUTHORIZED));
+        
+        let refs = borrow_global_mut<TokenRefs>(token_addr);
+        assert!(std::option::is_none(&refs.transfer_ref), error::invalid_state(100)); // already enabled
+        refs.transfer_ref = std::option::some(transfer_ref);
+        
+        TaxFreeCap { token_addr }
+    }
+
+    /// Executes a tax-free withdraw using the secured TransferRef.
+    /// Can only be called by a trusted DAO module holding the TaxFreeCap.
+    public fun withdraw_tax_free(
+        cap: &TaxFreeCap,
+        store: Object<supra_framework::fungible_asset::FungibleStore>,
+        amount: u64
+    ): supra_framework::fungible_asset::FungibleAsset acquires TokenRefs {
+        let refs = borrow_global<TokenRefs>(cap.token_addr);
+        let transfer_ref = std::option::borrow(&refs.transfer_ref);
+        
+        fungible_asset::withdraw_with_ref(transfer_ref, store, amount)
+    }
+
+    /// Executes a tax-free deposit using the secured TransferRef.
+    /// Can only be called by a trusted DAO module holding the TaxFreeCap.
+    public fun deposit_tax_free(
+        cap: &TaxFreeCap,
+        store: Object<supra_framework::fungible_asset::FungibleStore>,
+        fa: supra_framework::fungible_asset::FungibleAsset
+    ) acquires TokenRefs {
+        let refs = borrow_global<TokenRefs>(cap.token_addr);
+        let transfer_ref = std::option::borrow(&refs.transfer_ref);
+        
+        fungible_asset::deposit_with_ref(transfer_ref, store, fa);
     }
 
     // ========================================================================
