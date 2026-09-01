@@ -313,6 +313,18 @@ module dao_tokens::smart_token {
         exists<DaoTokenConfig>(token_addr)
     }
 
+    /// FIX (audit10 M3): read-only blacklist check for trusted modules.
+    /// The DAO's internal flows (locks, claims, votes) bypass the dispatch
+    /// hooks via the TaxFreeCap, so dao_factory must enforce the blacklist
+    /// explicitly. Returns false for tokens without a DaoTokenConfig (plain
+    /// FungibleAssets like HOG have no blacklist feature).
+    #[view]
+    public fun is_blacklisted(token_addr: address, account: address): bool acquires DaoTokenConfig {
+        if (!exists<DaoTokenConfig>(token_addr)) return false;
+        let config = borrow_global<DaoTokenConfig>(token_addr);
+        config.is_blacklist_active && vector::contains(&config.blacklist, &account)
+    }
+
     /// Transfers the admin role of the token to a new address (e.g. the DAO)
     public fun transfer_admin(
         token_addr: address,
